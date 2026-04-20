@@ -8,11 +8,19 @@ This client now supports two experiences:
 """
 
 import argparse
+import base64
+import json
+import os
 import queue
 import socket
 import threading
 import time
 from datetime import datetime
+
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import x25519
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 try:
     import tkinter as tk
@@ -24,11 +32,14 @@ except Exception:  # pragma: no cover - tkinter may not be available on some sys
     scrolledtext = None
 
 
-# Why threading on the client?
-# - Receiving data with recv() can block (wait).
-# - GUI/event loops and input() also block waiting for user actions.
-# If one thread handles recv and another handles UI/input,
-# the user can type while messages still appear live.
+def _derive_key(shared_secret: bytes, user_a: str, user_b: str) -> bytes:
+    pair_label = "|".join(sorted([user_a, user_b])).encode("utf-8")
+    return HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=b"neon-chat-dh-salt-v1",
+        info=b"neon-chat-e2e:" + pair_label,
+    ).derive(shared_secret)
 
 
 class ChatConnection:
@@ -44,23 +55,148 @@ class ChatConnection:
         self.incoming: "queue.Queue[str]" = queue.Queue()
         self.receiver_thread: threading.Thread | None = None
 
+        self._buffer = b""
+        self.peers: dict[str, str] = {}
+        self.peers_lock = threading.Lock()
+
+        self.private_key: x25519.X25519PrivateKey | None = None
+        self.public_key_b64 = ""
+
+    @staticmethod
+    def _send_json(sock: socket.socket, payload: dict) -> None:
+        sock.sendall((json.dumps(payload) + "\n").encode("utf-8"))
+
+    @staticmethod
+    def _decode_public_key(pubkey_b64: str) -> x25519.X25519PublicKey:
+        raw = base64.b64decode(pubkey_b64.encode("utf-8"))
+        return x25519.X25519PublicKey.from_public_bytes(raw)
+
     def connect(self) -> None:
+        self.private_key = x25519.X25519PrivateKey.generate()
+        public_key = self.private_key.public_key()
+        self.public_key_b64 = base64.b64encode(
+            public_key.public_bytes(
+                encoding=serialization.Encoding.Raw,
+                format=serialization.PublicFormat.Raw,
+            )
+        ).decode("utf-8")
+
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.socket.connect((self.host, self.port))
-        self.socket.sendall((self.username + "\n").encode("utf-8"))
+        self._send_json(
+            self.socket,
+            {
+                "type": "hello",
+                "username": self.username,
+                "pubkey": self.public_key_b64,
+            },
+        )
 
         self.receiver_thread = threading.Thread(target=self._receive_loop, daemon=True)
         self.receiver_thread.start()
 
+    def _handle_control_message(self, message: dict) -> None:
+        mtype = message.get("type")
+
+        if mtype == "server_notice":
+            text = str(message.get("text", "")).strip()
+            if text:
+                self.incoming.put(f"[SERVER] {text}\n")
+            return
+
+        if mtype == "roster":
+            peers = message.get("peers", [])
+            if isinstance(peers, list):
+                with self.peers_lock:
+                    self.peers.clear()
+                    for peer in peers:
+                        if not isinstance(peer, dict):
+                            continue
+                        username = str(peer.get("username", "")).strip()
+                        pubkey = str(peer.get("pubkey", "")).strip()
+                        if username and pubkey:
+                            self.peers[username] = pubkey
+            count = len(self.peers)
+            self.incoming.put(f"[SECURE] Connected with {count} peer key(s).\n")
+            return
+
+        if mtype == "peer_joined":
+            username = str(message.get("username", "")).strip()
+            pubkey = str(message.get("pubkey", "")).strip()
+            if username and pubkey:
+                with self.peers_lock:
+                    self.peers[username] = pubkey
+                self.incoming.put(f"[SERVER] {username} joined (secure channel ready).\n")
+            return
+
+        if mtype == "peer_left":
+            username = str(message.get("username", "")).strip()
+            if username:
+                with self.peers_lock:
+                    self.peers.pop(username, None)
+                self.incoming.put(f"[SERVER] {username} left the chat.\n")
+            return
+
+        if mtype == "encrypted":
+            self._handle_encrypted(message)
+
+    def _handle_encrypted(self, message: dict) -> None:
+        sender = str(message.get("sender", "")).strip()
+        sender_pub_b64 = str(message.get("sender_pubkey", "")).strip()
+        nonce_b64 = str(message.get("nonce", "")).strip()
+        ciphertext_b64 = str(message.get("ciphertext", "")).strip()
+
+        if not (sender and sender_pub_b64 and nonce_b64 and ciphertext_b64):
+            return
+
+        if self.private_key is None:
+            return
+
+        try:
+            sender_pub = self._decode_public_key(sender_pub_b64)
+            with self.peers_lock:
+                known = self.peers.get(sender)
+                if known is None:
+                    self.peers[sender] = sender_pub_b64
+                elif known != sender_pub_b64:
+                    self.incoming.put(f"[WARN] Key mismatch detected for {sender}. Message dropped.\n")
+                    return
+
+            shared_secret = self.private_key.exchange(sender_pub)
+            key = _derive_key(shared_secret, self.username, sender)
+            plaintext = AESGCM(key).decrypt(
+                base64.b64decode(nonce_b64),
+                base64.b64decode(ciphertext_b64),
+                None,
+            )
+            text = plaintext.decode("utf-8")
+        except Exception:
+            self.incoming.put(f"[WARN] Could not decrypt a message from {sender}.\n")
+            return
+
+        self.incoming.put(f"[{sender}] {text}\n")
+
     def _receive_loop(self) -> None:
         while not self.stop_event.is_set() and self.socket is not None:
             try:
-                data = self.socket.recv(1024)
-                if not data:
+                chunk = self.socket.recv(4096)
+                if not chunk:
                     self.incoming.put("\n[INFO] Disconnected: server closed the connection.\n")
                     self.stop_event.set()
                     break
-                self.incoming.put(data.decode("utf-8"))
+
+                self._buffer += chunk
+                while b"\n" in self._buffer:
+                    line, _, self._buffer = self._buffer.partition(b"\n")
+                    if not line.strip():
+                        continue
+                    try:
+                        payload = json.loads(line.decode("utf-8"))
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        continue
+                    if isinstance(payload, dict):
+                        self._handle_control_message(payload)
+
             except ConnectionResetError:
                 self.incoming.put("\n[INFO] Connection reset by server.\n")
                 self.stop_event.set()
@@ -70,9 +206,38 @@ class ChatConnection:
                 break
 
     def send(self, text: str) -> None:
-        if self.socket is None:
+        if self.socket is None or self.private_key is None:
             raise OSError("No active socket")
-        self.socket.sendall((text + "\n").encode("utf-8"))
+
+        with self.peers_lock:
+            peer_items = list(self.peers.items())
+
+        if not peer_items:
+            self.incoming.put("[WARN] No peers connected yet. Message not sent.\n")
+            return
+
+        for peer_username, peer_pub_b64 in peer_items:
+            try:
+                peer_pub = self._decode_public_key(peer_pub_b64)
+                shared_secret = self.private_key.exchange(peer_pub)
+                key = _derive_key(shared_secret, self.username, peer_username)
+
+                aes = AESGCM(key)
+                nonce = os.urandom(12)
+                ciphertext = aes.encrypt(nonce, text.encode("utf-8"), None)
+                self._send_json(
+                    self.socket,
+                    {
+                        "type": "encrypted",
+                        "sender": self.username,
+                        "sender_pubkey": self.public_key_b64,
+                        "recipient": peer_username,
+                        "nonce": base64.b64encode(nonce).decode("utf-8"),
+                        "ciphertext": base64.b64encode(ciphertext).decode("utf-8"),
+                    },
+                )
+            except Exception as exc:
+                self.incoming.put(f"[WARN] Failed secure send to {peer_username}: {exc}\n")
 
     def disconnect(self) -> None:
         self.stop_event.set()
