@@ -116,10 +116,10 @@ class ChatGUI:
             raise RuntimeError("Tkinter is not available on this machine.")
 
         self.connection = connection
-        self.show_timestamps = tk.BooleanVar(value=True)
         self.theme_name = "midnight"
 
         self.root = tk.Tk()
+        self.show_timestamps = tk.BooleanVar(master=self.root, value=True)
         self.root.title(f"Neon Chat • {self.connection.username}")
         self.root.geometry("920x620")
         self.root.minsize(760, 500)
