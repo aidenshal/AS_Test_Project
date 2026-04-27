@@ -105,6 +105,38 @@ class ChatServer:
         for dead in dead_sockets:
             self.remove_client(dead)
 
+    def find_client_socket(self, username: str) -> Optional[socket.socket]:
+        """Return the first socket matching username (case-insensitive), if connected."""
+        target = username.strip().lower()
+        if not target:
+            return None
+
+        with self.clients_lock:
+            for client_socket, known_username in self.clients.items():
+                if known_username.lower() == target:
+                    return client_socket
+        return None
+
+    def send_private_message(self, sender: str, target: str, message: str) -> bool:
+        """Send a private message to a single user. Returns True if delivered."""
+        target_socket = self.find_client_socket(target)
+        if target_socket is None:
+            return False
+
+        payload = f"[DM] {sender} -> you: {message}\n"
+        try:
+            target_socket.sendall(payload.encode("utf-8"))
+            return True
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            self.remove_client(target_socket)
+            return False
+
+    def list_users(self) -> str:
+        """Return a comma-separated list of connected usernames."""
+        with self.clients_lock:
+            usernames = sorted(self.clients.values(), key=lambda x: x.lower())
+        return ", ".join(usernames)
+
     def handle_client(self, client_socket: socket.socket, client_address: Tuple[str, int]) -> None:
         """Receive username, then relay chat messages from this client."""
         username = "unknown"
@@ -122,7 +154,9 @@ class ChatServer:
 
             print(f"[SERVER] {username} joined from {client_address[0]}:{client_address[1]}")
             self.broadcast(f"[SERVER] {username} has joined the chat.\n", exclude=client_socket)
-            client_socket.sendall(b"[SERVER] Welcome! Type /quit to leave.\n")
+            client_socket.sendall(
+                b"[SERVER] Welcome! Type /quit to leave, /who for user list, or /dm <user> <msg>.\n"
+            )
 
             while self.running:
                 data = client_socket.recv(1024)
@@ -132,6 +166,37 @@ class ChatServer:
 
                 text = data.decode("utf-8").strip()
                 if not text:
+                    continue
+
+                if text.startswith("/who"):
+                    users = self.list_users()
+                    client_socket.sendall(f"[SERVER] Online users: {users}\n".encode("utf-8"))
+                    continue
+
+                if text.startswith("/dm "):
+                    parts = text.split(maxsplit=2)
+                    if len(parts) < 3:
+                        client_socket.sendall(
+                            b"[SERVER] Usage: /dm <username> <message>\n"
+                        )
+                        continue
+
+                    target, dm_text = parts[1], parts[2]
+                    if target.lower() == username.lower():
+                        client_socket.sendall(
+                            "[SERVER] Nice try 😄 You cannot DM yourself.\n".encode("utf-8")
+                        )
+                        continue
+
+                    delivered = self.send_private_message(username, target, dm_text)
+                    if delivered:
+                        client_socket.sendall(
+                            f"[DM] you -> {target}: {dm_text}\n".encode("utf-8")
+                        )
+                    else:
+                        client_socket.sendall(
+                            f"[SERVER] User '{target}' is not online.\n".encode("utf-8")
+                        )
                     continue
 
                 full_message = f"[{username}] {text}\n"
