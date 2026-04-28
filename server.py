@@ -2,55 +2,53 @@
 """
 server.py - Beginner-friendly TCP chat server.
 
-This file creates a TCP server that accepts many client connections and
-broadcasts messages between them.
+This server routes encrypted payloads between clients and never decrypts
+chat message content.
 """
 
 import argparse
+import json
 import signal
 import socket
 import sys
 import threading
+from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
-# ------------------------------
-# Basic networking terms (quick notes)
-# ------------------------------
-# IP address: identifies a machine on a network (for local machine, 127.0.0.1).
-# Port: identifies a specific app/service on that machine (example: 5000).
-# TCP: reliable, connection-based protocol. Good for chat because messages
-#      arrive in order and with delivery checks.
-# localhost: special host name/IP that means "this same computer".
-#
-# Socket: a programming object that lets programs send/receive data on a network.
-# - Server socket: waits for incoming connections.
-# - Client socket: connects to a server and exchanges data.
-#
-# Important socket methods:
-# - bind((host, port)): attach server socket to a network address.
-# - listen(): mark server socket as ready to accept incoming connections.
-# - accept(): wait for an incoming connection; returns (client_socket, address).
-# - connect((host, port)): used by client socket to reach server.
-# - send()/sendall(): send bytes to the other side.
-# - recv(size): receive bytes from the other side.
+
+@dataclass
+class ClientSession:
+    username: str
+    public_key_b64: str
 
 
 class ChatServer:
-    """Simple multi-client TCP chat server using threads."""
+    """Threaded TCP chat router for end-to-end encrypted messages."""
 
     def __init__(self, host: str, port: int) -> None:
         self.host = host
         self.port = port
 
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        # Reuse address quickly after restart so "Address already in use" is less likely.
         self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
-        # Track connected clients: socket -> username
-        self.clients: Dict[socket.socket, str] = {}
+        self.clients_by_socket: Dict[socket.socket, ClientSession] = {}
+        self.clients_by_username: Dict[str, socket.socket] = {}
         self.clients_lock = threading.Lock()
 
         self.running = False
+
+    @staticmethod
+    def _send_json(client_socket: socket.socket, payload: dict) -> None:
+        client_socket.sendall((json.dumps(payload) + "\n").encode("utf-8"))
+
+    @staticmethod
+    def _try_parse_json(line: bytes) -> Optional[dict]:
+        try:
+            message = json.loads(line.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return None
+        return message if isinstance(message, dict) else None
 
     def start(self) -> None:
         """Bind, listen, and continuously accept clients."""
@@ -67,16 +65,10 @@ class ChatServer:
 
         while self.running:
             try:
-                # accept() blocks until a client connects.
                 client_socket, client_address = self.server_socket.accept()
             except OSError:
-                # Happens when socket is closed during shutdown.
                 break
 
-            # Why threading?
-            # Each client can block on recv(). If we handled clients one by one
-            # without threads, one slow client could freeze everyone else.
-            # A thread per client lets all users chat concurrently.
             thread = threading.Thread(
                 target=self.handle_client,
                 args=(client_socket, client_address),
@@ -86,125 +78,127 @@ class ChatServer:
 
         self.shutdown()
 
-    def broadcast(self, message: str, exclude: Optional[socket.socket] = None) -> None:
-        """Send a message to all connected clients except optional exclude socket."""
-        dead_sockets = []
+    def _send_notice(self, client_socket: socket.socket, text: str) -> None:
+        self._send_json(client_socket, {"type": "server_notice", "text": text})
 
+    def _broadcast_control(self, payload: dict, exclude: Optional[socket.socket] = None) -> None:
+        dead_sockets = []
         with self.clients_lock:
-            recipients = list(self.clients.keys())
+            recipients = list(self.clients_by_socket.keys())
 
         for client_socket in recipients:
             if client_socket is exclude:
                 continue
             try:
-                client_socket.sendall(message.encode("utf-8"))
+                self._send_json(client_socket, payload)
             except (BrokenPipeError, ConnectionResetError, OSError):
-                # Client is gone; schedule removal.
                 dead_sockets.append(client_socket)
 
         for dead in dead_sockets:
             self.remove_client(dead)
 
-    def find_client_socket(self, username: str) -> Optional[socket.socket]:
-        """Return the first socket matching username (case-insensitive), if connected."""
-        target = username.strip().lower()
-        if not target:
-            return None
+    def _register_client(self, client_socket: socket.socket, hello: dict) -> tuple[bool, str]:
+        username = str(hello.get("username", "")).strip() or "anonymous"
+        public_key_b64 = str(hello.get("pubkey", "")).strip()
+
+        if not public_key_b64:
+            return False, "Missing public key in hello message."
 
         with self.clients_lock:
-            for client_socket, known_username in self.clients.items():
-                if known_username.lower() == target:
-                    return client_socket
-        return None
+            if username in self.clients_by_username:
+                return False, f"Username '{username}' is already in use."
 
-    def send_private_message(self, sender: str, target: str, message: str) -> bool:
-        """Send a private message to a single user. Returns True if delivered."""
-        target_socket = self.find_client_socket(target)
+            self.clients_by_socket[client_socket] = ClientSession(
+                username=username,
+                public_key_b64=public_key_b64,
+            )
+            self.clients_by_username[username] = client_socket
+            peers = [
+                {"username": session.username, "pubkey": session.public_key_b64}
+                for sock, session in self.clients_by_socket.items()
+                if sock is not client_socket
+            ]
+
+        self._send_json(client_socket, {"type": "roster", "peers": peers})
+        self._send_notice(client_socket, "Welcome! Type /quit to leave.")
+
+        self._broadcast_control(
+            {
+                "type": "peer_joined",
+                "username": username,
+                "pubkey": public_key_b64,
+            },
+            exclude=client_socket,
+        )
+
+        print(f"[SERVER] {username} joined")
+        return True, username
+
+    def _route_encrypted(self, payload: dict) -> None:
+        recipient = str(payload.get("recipient", "")).strip()
+        if not recipient:
+            return
+
+        with self.clients_lock:
+            target_socket = self.clients_by_username.get(recipient)
+
         if target_socket is None:
-            return False
+            return
 
-        payload = f"[DM] {sender} -> you: {message}\n"
         try:
-            target_socket.sendall(payload.encode("utf-8"))
-            return True
+            self._send_json(target_socket, payload)
         except (BrokenPipeError, ConnectionResetError, OSError):
             self.remove_client(target_socket)
-            return False
-
-    def list_users(self) -> str:
-        """Return a comma-separated list of connected usernames."""
-        with self.clients_lock:
-            usernames = sorted(self.clients.values(), key=lambda x: x.lower())
-        return ", ".join(usernames)
 
     def handle_client(self, client_socket: socket.socket, client_address: Tuple[str, int]) -> None:
-        """Receive username, then relay chat messages from this client."""
+        """Receive control packets and route encrypted client-to-client messages."""
+        del client_address
         username = "unknown"
+        buffer = b""
+
         try:
-            # First message from client is username.
-            username_data = client_socket.recv(1024)
-            if not username_data:
+            hello_line = b""
+            while self.running and b"\n" not in buffer:
+                chunk = client_socket.recv(4096)
+                if not chunk:
+                    client_socket.close()
+                    return
+                buffer += chunk
+
+            hello_line, _, buffer = buffer.partition(b"\n")
+            hello = self._try_parse_json(hello_line)
+            if hello is None or hello.get("type") != "hello":
+                self._send_notice(client_socket, "Protocol error: expected hello packet.")
                 client_socket.close()
                 return
 
-            username = username_data.decode("utf-8").strip() or "anonymous"
-
-            with self.clients_lock:
-                self.clients[client_socket] = username
-
-            print(f"[SERVER] {username} joined from {client_address[0]}:{client_address[1]}")
-            self.broadcast(f"[SERVER] {username} has joined the chat.\n", exclude=client_socket)
-            client_socket.sendall(
-                b"[SERVER] Welcome! Type /quit to leave, /who for user list, or /dm <user> <msg>.\n"
-            )
+            ok, result = self._register_client(client_socket, hello)
+            if not ok:
+                self._send_notice(client_socket, result)
+                client_socket.close()
+                return
+            username = result
 
             while self.running:
-                data = client_socket.recv(1024)
-                if not data:
-                    # Client disconnected normally.
-                    break
-
-                text = data.decode("utf-8").strip()
-                if not text:
+                if b"\n" not in buffer:
+                    chunk = client_socket.recv(4096)
+                    if not chunk:
+                        break
+                    buffer += chunk
                     continue
 
-                if text.startswith("/who"):
-                    users = self.list_users()
-                    client_socket.sendall(f"[SERVER] Online users: {users}\n".encode("utf-8"))
+                raw_line, _, buffer = buffer.partition(b"\n")
+                if not raw_line.strip():
                     continue
 
-                if text.startswith("/dm "):
-                    parts = text.split(maxsplit=2)
-                    if len(parts) < 3:
-                        client_socket.sendall(
-                            b"[SERVER] Usage: /dm <username> <message>\n"
-                        )
-                        continue
-
-                    target, dm_text = parts[1], parts[2]
-                    if target.lower() == username.lower():
-                        client_socket.sendall(
-                            "[SERVER] Nice try 😄 You cannot DM yourself.\n".encode("utf-8")
-                        )
-                        continue
-
-                    delivered = self.send_private_message(username, target, dm_text)
-                    if delivered:
-                        client_socket.sendall(
-                            f"[DM] you -> {target}: {dm_text}\n".encode("utf-8")
-                        )
-                    else:
-                        client_socket.sendall(
-                            f"[SERVER] User '{target}' is not online.\n".encode("utf-8")
-                        )
+                message = self._try_parse_json(raw_line)
+                if message is None:
                     continue
 
-                full_message = f"[{username}] {text}\n"
-                print(full_message, end="")
-                self.broadcast(full_message, exclude=client_socket)
+                if message.get("type") == "encrypted":
+                    self._route_encrypted(message)
 
         except (ConnectionResetError, BrokenPipeError):
-            # Common network disconnect errors; handle gracefully.
             pass
         except OSError as exc:
             if self.running:
@@ -215,21 +209,22 @@ class ChatServer:
     def remove_client(self, client_socket: socket.socket) -> None:
         """Remove client safely and announce departure once."""
         with self.clients_lock:
-            username = self.clients.pop(client_socket, None)
+            session = self.clients_by_socket.pop(client_socket, None)
+            if session is not None:
+                self.clients_by_username.pop(session.username, None)
 
         try:
             client_socket.close()
         except OSError:
             pass
 
-        if username:
-            print(f"[SERVER] {username} left the chat")
-            self.broadcast(f"[SERVER] {username} has left the chat.\n", exclude=None)
+        if session:
+            print(f"[SERVER] {session.username} left the chat")
+            self._broadcast_control({"type": "peer_left", "username": session.username})
 
     def shutdown(self) -> None:
         """Close all sockets and stop server safely."""
         if not self.running:
-            # Invalid shutdown case: already stopped. Keep behavior safe.
             try:
                 self.server_socket.close()
             except OSError:
@@ -240,12 +235,13 @@ class ChatServer:
         print("\n[SERVER] Shutting down...")
 
         with self.clients_lock:
-            sockets = list(self.clients.keys())
-            self.clients.clear()
+            sockets = list(self.clients_by_socket.keys())
+            self.clients_by_socket.clear()
+            self.clients_by_username.clear()
 
         for client_socket in sockets:
             try:
-                client_socket.sendall(b"[SERVER] Server is shutting down.\n")
+                self._send_notice(client_socket, "Server is shutting down.")
             except OSError:
                 pass
             try:
