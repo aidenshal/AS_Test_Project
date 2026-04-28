@@ -42,3 +42,7 @@ python3 client.py --host 127.0.0.1 --port 5000 --ui auto
 - Unread message counter in the window title
 - Save chat transcript to text file (`Ctrl+S`)
 - Enter to send, `Ctrl+Enter` for newline
+
+## Cool server features
+- `/who` returns a live list of connected users
+- `/dm <username> <message>` sends a private message (DM) to one user
